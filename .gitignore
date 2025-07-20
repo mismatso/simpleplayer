@@ -1,0 +1,16 @@
+# El archivo de canciones debe generarse con el script generar_canciones.sh
+canciones.json
+
+# Ignorar las carpetas ocultas de editores
+.idea/
+.vscode/
+
+# Ignorar archivos de configuración de editores
+*.sublime-workspace
+*.sublime-project
+
+# Ignorar la carpeta bin
+bin/
+
+# Ignorar la carpeta vendor, librería como json.hpp debe ser instalada manualmente
+vendor/
