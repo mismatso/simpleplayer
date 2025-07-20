@@ -8,10 +8,9 @@ echo
 
 # Si no se paso ningún argumento la variable $directory es igual a “./mp3”
 directory=${1:-"./mp3"}
+file_name="./bin/canciones.json"
 
 # Verificar si el directorio existe
-# imprimo un enter antes del mensaje de error
-
 if [ ! -d "$directory" ]; then
   echo "El directorio $directory no existe." && echo
   exit 1
@@ -23,14 +22,14 @@ if ! command -v ffprobe &> /dev/null; then
   exit 1
 fi
 
-# Crear o vaciar el archivo canciones.json
-echo -n "" > canciones.json
+# Crear o vaciar el archivo $file_name
+echo -n "" > $file_name
 
-echo "Generando el archivo canciones.json"
-echo "en el directorio $directory..."
+echo "Generando el archivo $file_name"
+echo "indexando los MP3 del directorio: [$directory]"
 
 # Iniciar el archivo JSON
-echo "[" > canciones.json
+echo "[" > $file_name
 
 while IFS= read -r line; do
 
@@ -39,7 +38,13 @@ while IFS= read -r line; do
   
   directorio="$directory"
   archivo="$line.mp3"
+
+  # Aquí utilizamos el patrón «suffix removal» (%) para extraer el nombre del artista
+  # del nombre del archivo, asumiendo que el formato es "artista - título".
   artista="${line%% - *}"
+
+  # Aquí utilizamos el patrón «prefix removal» (#) para extraer el título
+  # del nombre del archivo, asumiendo que el formato es "artista - título".
   titulo="${line#* - }"
 
   # Obtener duración en segundos
@@ -52,18 +57,18 @@ while IFS= read -r line; do
   duracion_minutos=$(awk "BEGIN { printf \"%.2f\", $duracion / 60 }")
 
   # Generar entrada JSON
-  echo "  {" >> canciones.json
-  echo "    \"artista\": \"${artista}\"," >> canciones.json
-  echo "    \"titulo\": \"${titulo}\"," >> canciones.json
-  echo "    \"duracion_minutos\": ${duracion_minutos}," >> canciones.json
-  echo "    \"directorio\": \"${directorio}\"," >> canciones.json
-  echo "    \"archivo\": \"${archivo}\"" >> canciones.json
-  echo "  }," >> canciones.json
+  echo "  {" >> $file_name
+  echo "    \"artista\": \"${artista}\"," >> $file_name
+  echo "    \"titulo\": \"${titulo}\"," >> $file_name
+  echo "    \"duracion_minutos\": ${duracion_minutos}," >> $file_name
+  echo "    \"directorio\": \"${directorio}\"," >> $file_name
+  echo "    \"archivo\": \"${archivo}\"" >> $file_name
+  echo "  }," >> $file_name
 
 done < <(find "$directory" -type f -name "*.mp3" -exec basename {} \; | sed 's/\.mp3$//')
 
 # Eliminar la última coma y cerrar JSON
-sed -i '$ s/},/}/' canciones.json
-echo "]" >> canciones.json
+sed -i '$ s/},/}/' $file_name
+echo "]" >> $file_name
 
-echo "Archivo canciones.json generado exitosamente." && echo
+echo "Archivo $file_name generado exitosamente." && echo

@@ -1,9 +1,10 @@
 // Proyecto: SIMPLE PLAYER
 // By. Misael Matamoros
-// Fecha: 2023-10-15
-// Descripción: Un reproductor de música simple que permite cargar, reproducir, pausar y gestionar una lista de reproducción.
+// Fecha: 19 de julio de 2025
+// Descripción: Una interfaz de línea de comandos para un reproductor de música en modo de texto, que permite cargar, reproducir, pausar y gestionar música mp3 en una lista de reproducción.
+//
 // Requiere la biblioteca nlohmann/json para manejar JSON
-// Compilación: g++ simpleplayer.cpp -o simpleplayer -lpthread -ljsoncpp
+// Compilación: g++ -Wall -Wextra -std=c++17 simpleplayer.cpp -o ./bin/simpleplayer
 
 #include <iostream>          // Para entrada/salida estándar (cout, cin, endl)
 #include <fstream>           // Para manejo de archivos (ifstream, ofstream)
@@ -17,10 +18,15 @@
 #include <atomic>            // Para variables atómicas (sincronización entre hilos)
 #include <csignal>           // Para manejo de señales (kill, SIGKILL, etc.)
 #include <sys/wait.h>        // Para esperar procesos hijos (waitpid)
-#include "json.hpp"          // Para trabajar con JSON usando la biblioteca nlohmann/json
+#include "./vendor/json.hpp" // Para usar la clase json de nlohmann/json
 #include <chrono>            // Para medir y manipular tiempo (std::chrono)
 #include <mutex>             // Para exclusión mutua entre hilos (std::mutex)
 #include <condition_variable>// Para sincronización entre hilos (std::condition_variable)
+
+// Para manipulación de rutas de archivos y directorios
+#include <libgen.h>          // Para dirname() y basename()
+#include <climits>           // Para PATH_MAX
+#include <libgen.h>          // Para dirname() y basename()
 
 using json = nlohmann::json;
 using namespace std;
@@ -32,11 +38,12 @@ public:
     string titulo;
     string artista;
     string archivo;
+    string directorio;  // Agregar campo directorio
     double duracion_minutos;
 
     Cancion() = default;
-    Cancion(string t, string a, string f, double d)
-        : titulo(t), artista(a), archivo(f), duracion_minutos(d) {}
+    Cancion(string t, string a, string f, string d, double dur)
+        : titulo(t), artista(a), archivo(f), directorio(d), duracion_minutos(dur) {}
 };
 
 class NodoCancion {
@@ -132,6 +139,7 @@ public:
                 {"titulo", temp->cancion.titulo},
                 {"artista", temp->cancion.artista},
                 {"archivo", temp->cancion.archivo},
+                {"directorio", temp->cancion.directorio},  // Incluir directorio
                 {"duracion_minutos", temp->cancion.duracion_minutos}
             });
             temp = temp->siguiente;
@@ -148,7 +156,11 @@ public:
         f >> j;
         for (auto& item : j) {
             agregarCancion(Cancion(
-                item["titulo"], item["artista"], item["archivo"], item["duracion_minutos"]
+                item["titulo"], 
+                item["artista"], 
+                item["archivo"], 
+                item["directorio"],  // Cargar directorio
+                item["duracion_minutos"]
             ));
         }
     }
@@ -227,6 +239,17 @@ void hiloContador(int duracionSegundos) {
     }
 }
 
+// --- Función para obtener la ruta del ejecutable ---
+
+string obtenerRutaEjecutable() {
+    char resultado[PATH_MAX];
+    ssize_t count = readlink("/proc/self/exe", resultado, PATH_MAX);
+    if (count != -1) {
+        resultado[count] = '\0';
+        return string(dirname(resultado));
+    }
+    return "."; // Fallback al directorio actual
+}
 
 // --- Utilidades de consola ---
 
@@ -251,7 +274,11 @@ vector<Cancion> cargarCancionesDisponibles(const string& ruta) {
     archivo >> j;
     for (auto& item : j) {
         canciones.push_back(Cancion(
-            item["titulo"], item["artista"], item["archivo"], item["duracion_minutos"]
+            item["titulo"], 
+            item["artista"], 
+            item["archivo"], 
+            item["directorio"],  // Cargar directorio
+            item["duracion_minutos"]
         ));
     }
     return canciones;
@@ -278,8 +305,8 @@ atomic<bool> detener(false);
 atomic<bool> pausado(false);
 pid_t pid_mpg123 = 0;
 
-void reproducirCancion(const string& archivo) {
-    string ruta = "mp3/" + archivo;
+void reproducirCancion(const Cancion& cancion) {
+    string ruta = cancion.directorio + "/" + cancion.archivo;  // Usar directorio de la canción
     pid_mpg123 = fork();
     if (pid_mpg123 == 0) {
         execlp("mpg123", "mpg123", "-q", ruta.c_str(), nullptr);
@@ -371,7 +398,7 @@ void modoReproductor(Playlist& pl) {
     contadorResetear = false;
     contadorActivo = true;
     thread thContador(hiloContador, duracionSegundos);
-    reproducirCancion(nodo->cancion.archivo);
+    reproducirCancion(nodo->cancion);
     // --- FIN ---
 
     while (!salir) {
@@ -397,7 +424,7 @@ void modoReproductor(Playlist& pl) {
                 contadorActivo = true;
                 cvContador.notify_all();
                 duracionSegundos = (int)(nodo->cancion.duracion_minutos * 60);
-                reproducirCancion(nodo->cancion.archivo);
+                reproducirCancion(nodo->cancion);
                 break;
             case 'p':
             case 'P':
@@ -426,7 +453,7 @@ void modoReproductor(Playlist& pl) {
                         cvContador.notify_all();
                         nodo = pl.actual;
                         duracionSegundos = (int)(nodo->cancion.duracion_minutos * 60);
-                        reproducirCancion(pl.actual->cancion.archivo);
+                        reproducirCancion(pl.actual->cancion);
                     } else {
                         // Pausar el contador antes de mostrar el mensaje
                         contadorActivo = false;
@@ -445,7 +472,7 @@ void modoReproductor(Playlist& pl) {
                         cvContador.notify_all();
                         nodo = orden[idxShuffle];
                         duracionSegundos = (int)(nodo->cancion.duracion_minutos * 60);
-                        reproducirCancion(orden[idxShuffle]->cancion.archivo);
+                        reproducirCancion(orden[idxShuffle]->cancion);
                     } else {
                         // Pausar el contador antes de mostrar el mensaje
                         contadorActivo = false;
@@ -469,7 +496,7 @@ void modoReproductor(Playlist& pl) {
                         cvContador.notify_all();
                         nodo = pl.actual;
                         duracionSegundos = (int)(nodo->cancion.duracion_minutos * 60);
-                        reproducirCancion(pl.actual->cancion.archivo);
+                        reproducirCancion(pl.actual->cancion);
                     } else {
                         // Pausar el contador antes de mostrar el mensaje
                         contadorActivo = false;
@@ -488,7 +515,7 @@ void modoReproductor(Playlist& pl) {
                         cvContador.notify_all();
                         nodo = orden[idxShuffle];
                         duracionSegundos = (int)(nodo->cancion.duracion_minutos * 60);
-                        reproducirCancion(orden[idxShuffle]->cancion.archivo);
+                        reproducirCancion(orden[idxShuffle]->cancion);
                     } else {
                         // Pausar el contador antes de mostrar el mensaje
                         contadorActivo = false;
@@ -544,9 +571,13 @@ void menuPrincipal() {
 }
 
 int main() {
-    vector<Cancion> cancionesDisponibles = cargarCancionesDisponibles("canciones.json");
+    string rutaEjecutable = obtenerRutaEjecutable();
+    string rutaCanciones = rutaEjecutable + "/canciones.json";
+    string rutaPlaylist = rutaEjecutable + "/playlist.json";
+
+    vector<Cancion> cancionesDisponibles = cargarCancionesDisponibles(rutaCanciones);
     Playlist miPlaylist;
-    miPlaylist.cargar("playlist.json");
+    miPlaylist.cargar(rutaPlaylist);
 
     int opcion;
     do {
@@ -593,8 +624,8 @@ int main() {
                 modoReproductor(miPlaylist);
                 break;
             case 6:
-                miPlaylist.guardar("playlist.json");
-                cout << "Playlist guardada en playlist.json" << endl;
+                miPlaylist.guardar(rutaPlaylist);
+                cout << "Playlist guardada en " << rutaPlaylist << endl;
                 pausa();
                 break;
             case 7:
@@ -610,7 +641,7 @@ int main() {
                 pausa();
                 break;
             case 8:
-                miPlaylist.guardar("playlist.json");
+                miPlaylist.guardar(rutaPlaylist);
                 cout << "¡Hasta luego!" << endl;
                 break;
             default:
