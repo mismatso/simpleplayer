@@ -4,6 +4,7 @@
 // Descripción: Una interfaz de línea de comandos para un reproductor de música en modo de texto, que permite cargar, reproducir, pausar y gestionar música mp3 en una lista de reproducción.
 //
 // Requiere la biblioteca nlohmann/json para manejar JSON
+// Requiere ffmpeg (ffplay y ffprobe) para reproducción y análisis de audio
 // Compilación: g++ -Wall -Wextra -std=c++17 simpleplayer.cpp -o ./bin/simpleplayer
 
 #include <iostream>          // Para entrada/salida estándar (cout, cin, endl)
@@ -18,6 +19,7 @@
 #include <atomic>            // Para variables atómicas (sincronización entre hilos)
 #include <csignal>           // Para manejo de señales (kill, SIGKILL, etc.)
 #include <sys/wait.h>        // Para esperar procesos hijos (waitpid)
+#include <sys/select.h>      // Para select() y fd_set
 #include "./vendor/json.hpp" // Para usar la clase json de nlohmann/json
 #include <chrono>            // Para medir y manipular tiempo (std::chrono)
 #include <mutex>             // Para exclusión mutua entre hilos (std::mutex)
@@ -25,8 +27,8 @@
 
 // Para manipulación de rutas de archivos y directorios
 #include <libgen.h>          // Para dirname() y basename()
-#include <climits>           // Para PATH_MAX
-#include <libgen.h>          // Para dirname() y basename()
+#include <fcntl.h>           // Para open() y O_WRONLY
+#include <limits.h>          // Para PATH_MAX
 
 using json = nlohmann::json;
 using namespace std;
@@ -35,15 +37,15 @@ using namespace std;
 
 class Cancion {
 public:
+    string artista;    
     string titulo;
-    string artista;
-    string archivo;
-    string directorio;  // Agregar campo directorio
     double duracion_minutos;
+    string directorio;
+    string archivo;
 
     Cancion() = default;
-    Cancion(string t, string a, string f, string d, double dur)
-        : titulo(t), artista(a), archivo(f), directorio(d), duracion_minutos(dur) {}
+    Cancion(string a, string t, double dur, string d, string f)
+        : artista(a), titulo(t), duracion_minutos(dur), directorio(d), archivo(f) {}
 };
 
 class NodoCancion {
@@ -136,11 +138,11 @@ public:
         NodoCancion* temp = cabeza;
         while (temp) {
             j.push_back({
-                {"titulo", temp->cancion.titulo},
                 {"artista", temp->cancion.artista},
-                {"archivo", temp->cancion.archivo},
-                {"directorio", temp->cancion.directorio},  // Incluir directorio
-                {"duracion_minutos", temp->cancion.duracion_minutos}
+                {"titulo", temp->cancion.titulo},
+                {"duracion_minutos", temp->cancion.duracion_minutos},
+                {"directorio", temp->cancion.directorio},
+                {"archivo", temp->cancion.archivo}
             });
             temp = temp->siguiente;
         }
@@ -156,11 +158,11 @@ public:
         f >> j;
         for (auto& item : j) {
             agregarCancion(Cancion(
-                item["titulo"], 
-                item["artista"], 
-                item["archivo"], 
-                item["directorio"],  // Cargar directorio
-                item["duracion_minutos"]
+                item["artista"],
+                item["titulo"],
+                item["duracion_minutos"],
+                item["directorio"],
+                item["archivo"]
             ));
         }
     }
@@ -208,33 +210,79 @@ atomic<bool> contadorResetear(false);
 mutex mtxContador;
 condition_variable cvContador;
 
+// Variables globales para el control automático
+atomic<bool> avanzarAutomatico(false);
+
+// Variables globales adicionales
+atomic<int> saltoSegundos(10);
+
+// --- Reproducción de audio con ffplay ---
+atomic<bool> reproduciendo(false);
+atomic<bool> pausado(false);
+pid_t pid_ffplay = 0;
+
+// Variable global para detectar cuando un proceso hijo termina
+atomic<bool> procesoTerminado(false);
+
 // Función para mostrar el tiempo actual en formato 0h 0m 00s
 void mostrarTiempoActual(int segundos) {
     int h = segundos / 3600;
     int m = (segundos % 3600) / 60;
     int s = segundos % 60;
     // Sube 5 líneas (ajusta si tu interfaz cambia)
-    cout << "\033[9A\r";
+    cout << "\033[10A\r";
     cout << "Tiempo actual: " << h << "h " << m << "m " << s << "s      ";
-    cout << "\033[9B" << flush; // Regresa a la posición original
+    cout << "\033[10B" << flush; // Regresa a la posición original
 }
 
-// Hilo contador de tiempo
+// Manejador de señal SIGCHLD mejorado
+void manejadorSIGCHLD(int sig) {
+    (void)sig; // Evitar warning de parámetro no usado
+    int status;
+    pid_t pid = waitpid(-1, &status, WNOHANG);
+    if (pid == pid_ffplay && pid > 0) {
+
+        // Debug temporal
+        // write(STDERR_FILENO, "SIGCHLD recibido\n", 17);
+
+        pid_ffplay = 0; // Resetear el PID
+        procesoTerminado = true;
+        contadorActivo = false;
+        avanzarAutomatico = true;
+        cvContador.notify_all(); // Despertar el hilo contador
+    }
+}
+
+// Hilo contador simplificado
 void hiloContador(int duracionSegundos) {
-    tiempoActualSegundos = 0;
     while (!contadorSalir) {
         unique_lock<mutex> lk(mtxContador);
-        cvContador.wait_for(lk, chrono::seconds(1), []{ return !contadorActivo || contadorSalir || contadorResetear; });
+        cvContador.wait_for(lk, chrono::seconds(1), []{ return !contadorActivo || contadorSalir || contadorResetear || procesoTerminado; });
+        
         if (contadorSalir) break;
+        
         if (contadorResetear) {
             tiempoActualSegundos = 0;
             contadorResetear = false;
+            procesoTerminado = false;
             continue;
         }
+        
+        if (procesoTerminado) {
+            // El proceso terminó, el manejador ya configuró avanzarAutomatico
+            break;
+        }
+        
         if (contadorActivo) {
             tiempoActualSegundos++;
-            if (tiempoActualSegundos > duracionSegundos) break;
             mostrarTiempoActual(tiempoActualSegundos);
+            
+            // Verificar por tiempo como backup
+            if (tiempoActualSegundos >= duracionSegundos) {
+                contadorActivo = false;
+                avanzarAutomatico = true;
+                break;
+            }
         }
     }
 }
@@ -274,63 +322,131 @@ vector<Cancion> cargarCancionesDisponibles(const string& ruta) {
     archivo >> j;
     for (auto& item : j) {
         canciones.push_back(Cancion(
-            item["titulo"], 
             item["artista"], 
-            item["archivo"], 
-            item["directorio"],  // Cargar directorio
-            item["duracion_minutos"]
+            item["titulo"], 
+            item["duracion_minutos"],
+            item["directorio"],
+            item["archivo"]
         ));
     }
     return canciones;
 }
 
-// --- Detección de tecla sin ENTER ---
-
-char leerTecla() {
-    struct termios oldt, newt;
-    char ch;
-    tcgetattr(STDIN_FILENO, &oldt);
-    newt = oldt;
-    newt.c_lflag &= ~(ICANON | ECHO);
-    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-    ch = getchar();
-    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-    return ch;
-}
-
-// --- Reproducción de audio con mpg123 (en hilo) ---
-
-atomic<bool> reproduciendo(false);
-atomic<bool> detener(false);
-atomic<bool> pausado(false);
-pid_t pid_mpg123 = 0;
-
-void reproducirCancion(const Cancion& cancion) {
-    string ruta = cancion.directorio + "/" + cancion.archivo;  // Usar directorio de la canción
-    pid_mpg123 = fork();
-    if (pid_mpg123 == 0) {
-        execlp("mpg123", "mpg123", "-q", ruta.c_str(), nullptr);
+// Función para reproducir desde una posición específica usando ffplay
+void reproducirDesdeSegundo(const Cancion& cancion, int segundoInicio = 0) {
+    string ruta = cancion.directorio + "/" + cancion.archivo;
+    
+    // Detener reproducción anterior si existe
+    if (pid_ffplay > 0) {
+        kill(pid_ffplay, SIGTERM);
+        waitpid(pid_ffplay, nullptr, 0);
+        pid_ffplay = 0;
+    }
+    
+    pid_ffplay = fork();
+    if (pid_ffplay == 0) {
+        // Redirigir stdout y stderr a /dev/null
+        int devnull = open("/dev/null", O_WRONLY);
+        dup2(devnull, STDOUT_FILENO);
+        dup2(devnull, STDERR_FILENO);
+        close(devnull);
+        
+        if (segundoInicio > 0) {
+            // Usar ffplay con opción -ss para saltar tiempo
+            string salto = to_string(segundoInicio);
+            execlp("ffplay", "ffplay", "-nodisp", "-autoexit", "-ss", salto.c_str(), ruta.c_str(), nullptr);
+        } else {
+            // Reproducción normal desde el inicio
+            execlp("ffplay", "ffplay", "-nodisp", "-autoexit", ruta.c_str(), nullptr);
+        }
         exit(1);
     }
-    // Iniciar el contador con la reproducción
-    contadorActivo = true;
-    cvContador.notify_all();
+    
+    // Asegurar que las variables de estado estén correctas
+    reproduciendo = true;
+    pausado = false;
+}
+
+// Función para reproducir una canción (wrapper)
+void reproducirCancion(const Cancion& cancion) {
+    reproducirDesdeSegundo(cancion, 0);
 }
 
 void detenerCancion() {
-    if (pid_mpg123 > 0) {
-        kill(pid_mpg123, SIGKILL);
-        waitpid(pid_mpg123, nullptr, 0);
-        pid_mpg123 = 0;
+    if (pid_ffplay > 0) {
+        kill(pid_ffplay, SIGTERM);
+        waitpid(pid_ffplay, nullptr, 0);
+        pid_ffplay = 0;
     }
+    reproduciendo = false;
+    pausado = false;
 }
 
 void pausarCancion() {
-    if (pid_mpg123 > 0) kill(pid_mpg123, SIGSTOP);
+    if (pid_ffplay > 0 && reproduciendo) {
+        kill(pid_ffplay, SIGSTOP); // Pausar el proceso
+    }
 }
 
 void reanudarCancion() {
-    if (pid_mpg123 > 0) kill(pid_mpg123, SIGCONT);
+    if (pid_ffplay > 0 && reproduciendo) {
+        kill(pid_ffplay, SIGCONT); // Reanudar el proceso
+    }
+}
+
+// Función mejorada para avanzar rápido with ffplay
+void avanzarRapido(const Cancion& cancion, int duracionSegundos, thread& thContador) {
+    if (reproduciendo) {
+        int nuevoTiempo = tiempoActualSegundos + saltoSegundos;
+        if (nuevoTiempo >= duracionSegundos) {
+            // Si excede la duración, activar avance automático
+            avanzarAutomatico = true;
+        } else {
+            // Finalizar hilo contador anterior
+            contadorSalir = true;
+            contadorActivo = false;
+            cvContador.notify_all();
+            if (thContador.joinable()) thContador.join();
+            
+            // Actualizar tiempo ANTES de reproducir
+            tiempoActualSegundos = nuevoTiempo;
+            
+            // Reproducir desde nueva posición
+            reproducirDesdeSegundo(cancion, nuevoTiempo);
+            
+            // Reiniciar hilo contador
+            contadorSalir = false;
+            contadorResetear = false;
+            contadorActivo = true;
+            thContador = thread(hiloContador, duracionSegundos);
+        }
+    }
+}
+
+// Función mejorada para retroceder con ffplay
+void retroceder(const Cancion& cancion, int duracionSegundos, thread& thContador) {
+    if (reproduciendo) {
+        int nuevoTiempo = tiempoActualSegundos - saltoSegundos;
+        if (nuevoTiempo < 0) nuevoTiempo = 0;
+        
+        // Finalizar hilo contador anterior
+        contadorSalir = true;
+        contadorActivo = false;
+        cvContador.notify_all();
+        if (thContador.joinable()) thContador.join();
+        
+        // Actualizar tiempo ANTES de reproducir
+        tiempoActualSegundos = nuevoTiempo;
+        
+        // Reproducir desde nueva posición
+        reproducirDesdeSegundo(cancion, nuevoTiempo);
+        
+        // Reiniciar hilo contador
+        contadorSalir = false;
+        contadorResetear = false;
+        contadorActivo = true;
+        thContador = thread(hiloContador, duracionSegundos);
+    }
 }
 
 // --- Modo reproductor interactivo ---
@@ -352,8 +468,9 @@ void mostrarVistaReproductor(Playlist& pl, bool shuffle, int idx, NodoCancion* n
     cout << "------------------------------------------" << endl;
     cout << "Presiona un comando en cualquier momento:" << endl;
     cout << endl;
-    cout << "[R] = Reproducir | [P] = Pausar" << endl;
-    cout << "[S] = Siguiente  | [A] = Anterior" << endl;
+    cout << "[R] = Reproducir    | [P] = Pausar" << endl;
+    cout << "[S] = Siguiente     | [A] = Anterior" << endl;
+    cout << "[F] = Avance rápido | [B] = Retroceso" << endl;
     cout << "[M] = Modo aleatorio [" << (shuffle ? "On" : "Off") << "]" << endl;
     cout << "[Q] = Detener" << endl;
     cout << "------------------------------------------" << endl;
@@ -397,11 +514,83 @@ void modoReproductor(Playlist& pl) {
     contadorSalir = false;
     contadorResetear = false;
     contadorActivo = true;
+    avanzarAutomatico = false;
+    procesoTerminado = false;
     thread thContador(hiloContador, duracionSegundos);
     reproducirCancion(nodo->cancion);
     // --- FIN ---
 
     while (!salir) {
+        // Verificar si necesita avanzar automáticamente
+        if (avanzarAutomatico) {
+            avanzarAutomatico = false;
+            
+            // Debug temporal
+            // cout << "\rAvance automático activado..." << flush;
+            // this_thread::sleep_for(chrono::milliseconds(500));
+            
+            // Finalizar hilo contador anterior si aún está corriendo
+            contadorSalir = true;
+            contadorActivo = false;
+            cvContador.notify_all();
+            if (thContador.joinable()) thContador.join();
+            
+            if (!shuffle) {
+                if (nodo->siguiente) {
+                    pl.actual = nodo->siguiente;
+                    ultimaCancion = pl.actual->cancion.archivo;
+                    nodo = pl.actual;
+                    duracionSegundos = (int)(nodo->cancion.duracion_minutos * 60);
+                    
+                    // Reiniciar reproducción
+                    reproduciendo = true;
+                    pausado = false;
+                    tiempoActualSegundos = 0;
+                    contadorSalir = false;
+                    contadorResetear = false;
+                    contadorActivo = true;
+                    procesoTerminado = false;
+                    
+                    thContador = thread(hiloContador, duracionSegundos);
+                    reproducirCancion(pl.actual->cancion);
+                } else {
+                    // Fin de la playlist
+                    reproduciendo = false;
+                    contadorActivo = false;
+                    cout << "\rFin de la playlist." << endl;
+                    pausa();
+                }
+            } else {
+                if (idxShuffle + 1 < (int)orden.size()) {
+                    idxShuffle++;
+                    ultimaCancion = orden[idxShuffle]->cancion.archivo;
+                    nodo = orden[idxShuffle];
+                    duracionSegundos = (int)(nodo->cancion.duracion_minutos * 60);
+                    
+                    // Reiniciar reproducción
+                    reproduciendo = true;
+                    pausado = false;
+                    tiempoActualSegundos = 0;
+                    contadorSalir = false;
+                    contadorResetear = false;
+                    contadorActivo = true;
+                    procesoTerminado = false;
+                    
+                    thContador = thread(hiloContador, duracionSegundos);
+                    reproducirCancion(orden[idxShuffle]->cancion);
+                } else {
+                    // Fin de la playlist aleatoria
+                    reproduciendo = false;
+                    contadorActivo = false;
+                    cout << "\rFin de la playlist aleatoria." << endl;
+                    pausa();
+                }
+            }
+            
+            // Continuar el bucle para actualizar la interfaz
+            continue;
+        }
+
         if (!shuffle) {
             idx = pl.indiceActual();
             nodo = pl.nodoEn(idx);
@@ -413,17 +602,56 @@ void modoReproductor(Playlist& pl) {
         mostrarVistaReproductor(pl, shuffle, idx, nodo);
         mostrarTiempoActual(tiempoActualSegundos);
 
-        char tecla = leerTecla();
+        // Usar un timeout más corto para detectar cambios más rápido
+        struct termios oldt, newt;
+        tcgetattr(STDIN_FILENO, &oldt);
+        newt = oldt;
+        newt.c_lflag &= ~(ICANON | ECHO);
+        tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+        
+        // Configurar timeout para detectar avance automático más rápido
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(STDIN_FILENO, &fds);
+        struct timeval timeout;
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 500000; // 500ms
+        
+        char tecla = 0;
+        int result = select(STDIN_FILENO + 1, &fds, NULL, NULL, &timeout);
+        if (result > 0 && FD_ISSET(STDIN_FILENO, &fds)) {
+            tecla = getchar();
+        }
+        
+        tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+        
+        // Si no hay tecla pero hay avance automático, continuar el bucle
+        if (result == 0 || tecla == 0) {
+            if (avanzarAutomatico) continue;
+            else continue; // Continuar el bucle para verificar estado
+        }
+
         switch (tecla) {
             case 'r':
             case 'R':
                 if (reproduciendo) detenerCancion();
+                
+                // Finalizar hilo contador anterior
+                contadorSalir = true;
+                contadorActivo = false;
+                cvContador.notify_all();
+                if (thContador.joinable()) thContador.join();
+                
                 reproduciendo = true;
                 pausado = false;
                 contadorResetear = true;
                 contadorActivo = true;
-                cvContador.notify_all();
+                avanzarAutomatico = false;
+                procesoTerminado = false;
                 duracionSegundos = (int)(nodo->cancion.duracion_minutos * 60);
+                
+                contadorSalir = false;
+                thContador = thread(hiloContador, duracionSegundos);
                 reproducirCancion(nodo->cancion);
                 break;
             case 'p':
@@ -442,6 +670,13 @@ void modoReproductor(Playlist& pl) {
             case 's':
             case 'S':
                 if (reproduciendo) detenerCancion();
+                
+                // Finalizar hilo contador anterior
+                contadorSalir = true;
+                contadorActivo = false;
+                cvContador.notify_all();
+                if (thContador.joinable()) thContador.join();
+                
                 if (!shuffle) {
                     if (nodo->siguiente) {
                         pl.actual = nodo->siguiente;
@@ -450,14 +685,14 @@ void modoReproductor(Playlist& pl) {
                         pausado = false;
                         contadorResetear = true;
                         contadorActivo = true;
-                        cvContador.notify_all();
+                        avanzarAutomatico = false;
                         nodo = pl.actual;
                         duracionSegundos = (int)(nodo->cancion.duracion_minutos * 60);
+                        
+                        contadorSalir = false;
+                        thContador = thread(hiloContador, duracionSegundos);
                         reproducirCancion(pl.actual->cancion);
                     } else {
-                        // Pausar el contador antes de mostrar el mensaje
-                        contadorActivo = false;
-                        cvContador.notify_all();
                         cout << "\rFin de la lista." << endl;
                         pausa();
                     }
@@ -469,14 +704,14 @@ void modoReproductor(Playlist& pl) {
                         pausado = false;
                         contadorResetear = true;
                         contadorActivo = true;
-                        cvContador.notify_all();
+                        avanzarAutomatico = false;
                         nodo = orden[idxShuffle];
                         duracionSegundos = (int)(nodo->cancion.duracion_minutos * 60);
+                        
+                        contadorSalir = false;
+                        thContador = thread(hiloContador, duracionSegundos);
                         reproducirCancion(orden[idxShuffle]->cancion);
                     } else {
-                        // Pausar el contador antes de mostrar el mensaje
-                        contadorActivo = false;
-                        cvContador.notify_all();
                         cout << "\rFin de la lista aleatoria." << endl;
                         pausa();
                     }
@@ -485,6 +720,13 @@ void modoReproductor(Playlist& pl) {
             case 'a':
             case 'A':
                 if (reproduciendo) detenerCancion();
+                
+                // Finalizar hilo contador anterior
+                contadorSalir = true;
+                contadorActivo = false;
+                cvContador.notify_all();
+                if (thContador.joinable()) thContador.join();
+                
                 if (!shuffle) {
                     if (nodo->anterior) {
                         pl.actual = nodo->anterior;
@@ -493,14 +735,14 @@ void modoReproductor(Playlist& pl) {
                         pausado = false;
                         contadorResetear = true;
                         contadorActivo = true;
-                        cvContador.notify_all();
+                        avanzarAutomatico = false;
                         nodo = pl.actual;
                         duracionSegundos = (int)(nodo->cancion.duracion_minutos * 60);
+                        
+                        contadorSalir = false;
+                        thContador = thread(hiloContador, duracionSegundos);
                         reproducirCancion(pl.actual->cancion);
                     } else {
-                        // Pausar el contador antes de mostrar el mensaje
-                        contadorActivo = false;
-                        cvContador.notify_all();
                         cout << "\rInicio de la lista." << endl;
                         pausa();
                     }
@@ -512,18 +754,26 @@ void modoReproductor(Playlist& pl) {
                         pausado = false;
                         contadorResetear = true;
                         contadorActivo = true;
-                        cvContador.notify_all();
+                        avanzarAutomatico = false;
                         nodo = orden[idxShuffle];
                         duracionSegundos = (int)(nodo->cancion.duracion_minutos * 60);
+                        
+                        contadorSalir = false;
+                        thContador = thread(hiloContador, duracionSegundos);
                         reproducirCancion(orden[idxShuffle]->cancion);
                     } else {
-                        // Pausar el contador antes de mostrar el mensaje
-                        contadorActivo = false;
-                        cvContador.notify_all();
                         cout << "\rInicio de la lista aleatoria." << endl;
                         pausa();
                     }
                 }
+                break;
+            case 'f':
+            case 'F':
+                avanzarRapido(nodo->cancion, duracionSegundos, thContador);
+                break;
+            case 'b':
+            case 'B':
+                retroceder(nodo->cancion, duracionSegundos, thContador);
                 break;
             case 'm':
             case 'M':
@@ -571,6 +821,9 @@ void menuPrincipal() {
 }
 
 int main() {
+    // Configurar manejador de señal SIGCHLD
+    signal(SIGCHLD, manejadorSIGCHLD);
+    
     string rutaEjecutable = obtenerRutaEjecutable();
     string rutaCanciones = rutaEjecutable + "/canciones.json";
     string rutaPlaylist = rutaEjecutable + "/playlist.json";
