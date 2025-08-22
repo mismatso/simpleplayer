@@ -6,6 +6,9 @@ echo "Este script generará un archivo JSON con la información de"
 echo "las canciones en el directorio especificado."
 echo
 
+# Si no existe el directorio bin lo crea
+mkdir -p ./bin
+
 # Si no se paso ningún argumento la variable $directory es igual a “./mp3”
 directory=${1:-"./mp3"}
 file_name="./bin/canciones.json"

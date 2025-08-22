@@ -1,6 +1,5 @@
-// Proyecto: SIMPLE PLAYER
+// Proyecto: SimplePlayer
 // By. Misael Matamoros
-// Fecha: 19 de julio de 2025
 // Descripción: Una interfaz de línea de comandos para un reproductor de música en modo de texto, que permite cargar, reproducir, pausar y gestionar música mp3 en una lista de reproducción.
 //
 // Requiere la biblioteca nlohmann/json para manejar JSON
